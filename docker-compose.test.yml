@@ -112,10 +112,11 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
       RABBITMQ_NODE_PORT: 5673 # had to change the default port because of a conflict with the mongodb port 
     healthcheck:
-      test: rabbitmq-diagnostics check_port_connectivity
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 10s
-      timeout: 30s
-      retries: 3
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     networks:
       - test_network
 
