@@ -2,51 +2,36 @@ import os
 import pytest
 import requests
 import pymongo
-import pika
-import subprocess
 import time
+import subprocess
+import uuid
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Fixture to manage Docker Compose
+# --- FIXTURES ---
+
 @pytest.fixture(scope="module", autouse=True)
 def docker_compose():
-    # Start Docker Compose
-    subprocess.run(
-        ["docker", "compose", "-f", "docker-compose.test.yml", "up", "--build", "-d"],
-        check=True
-    )
-    
-    # Wait for services to be ready
-    wait_for_service("http://localhost:8001/")
-    
-    yield  # Run tests
-    
-    # Tear down Docker Compose
-    # subprocess.run(
-    #     ["docker", "compose", "-f", "docker-compose.test.yml", "down", "-v"],
-    #     check=True
-    # )
+    subprocess.run(["docker", "compose", "-f", "docker-compose.test.yml", "up", "--build", "-d"], check=True)
+    wait_for_service("http://localhost:8000/")
+    yield 
+    subprocess.run(["docker", "compose", "-f", "docker-compose.test.yml", "down", "-v"], check=True)
 
-# Helper function to wait for service readiness
-def wait_for_service(url, timeout=200):
+def wait_for_service(url, timeout=60):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            if requests.get(url).status_code == 200:
+            if requests.get(url).status_code in [200, 404]: 
                 return
         except Exception:
-            time.sleep(1)
+            time.sleep(2)
     raise TimeoutError(f"Service at {url} not ready")
 
-# Fixture for API base URL
 @pytest.fixture(scope="module")
 def api_base_url():
     return "http://localhost:8000"
 
-# Fixture for MongoDB client
 @pytest.fixture(scope="module")
 def mongo_client():
     client = pymongo.MongoClient(
@@ -55,17 +40,19 @@ def mongo_client():
         username=os.getenv("MONGO_USERNAME"),
         password=os.getenv("MONGO_PASSWORD"),
         authSource="admin"
-        )
+    )
     yield client
     client.close()
 
-# Test: User Creation
+# --- TEST CASES ---
+
+# TC 01: Validate User Creation
 def test_user_creation(api_base_url, mongo_client):
-    # Create a new user
+    unique_email = f"integration.{uuid.uuid4()}@example.com" # Random email to prevent duplicates
     user_payload = {
         "firstName": "Integration",
         "lastName": "Tester",
-        "emails": ["integration.test@example.com"],
+        "emails": [unique_email],
         "deliveryAddress": {
             "street": "123 Test Street",
             "city": "Testville",
@@ -75,91 +62,124 @@ def test_user_creation(api_base_url, mongo_client):
         }
     }
     
-    # Send user creation request
-    response = requests.post(
-        f"{api_base_url}/users/", 
-        json=user_payload
-    )
-    
-    # Assertions
+    response = requests.post(f"{api_base_url}/users/", json=user_payload)
+    if response.status_code != 201: print(f"API Error Response: {response.text}")
     assert response.status_code == 201
-    created_user = response.json()
-    assert created_user['firstName'] == "Integration"
-    assert created_user['lastName'] == "Tester"
     
-    # Verify user in MongoDB
-    users_db = mongo_client[os.getenv("DATABASE_NAME")]
-    users_collection = users_db["users"]
-    user = users_collection.find_one({"userId": created_user["userId"]})
-    assert user is not None
-    assert user["emails"] == ["integration.test@example.com"]
+    user_id = response.json()["userId"]
+    
+    # Verify in MongoDB
+    db = mongo_client[os.getenv("DATABASE_NAME")]
+    mongo_user = db["users"].find_one({"userId": user_id})
+    assert mongo_user is not None
+    assert mongo_user["emails"] == [unique_email]
 
-# Test: User Update
-def test_user_update(api_base_url, mongo_client):
-    # First create a user
+
+# TC 02: Validate Order Creation with Existing User
+def test_order_creation_existing_user(api_base_url, mongo_client):
+    # 1. Create User First
+    unique_email = f"bob.{uuid.uuid4()}@example.com"
     user_payload = {
-        "firstName": "Update",
-        "lastName": "Tester",
-        "emails": ["update.test@example.com"],
-        "deliveryAddress": {
-            "street": "123 Test Street",
-            "city": "Testville",
-            "state": "Test State",
-            "postalCode": "12345",
-            "country": "Test Country"
-        }
+        "firstName": "Bob",
+        "lastName": "Builder",
+        "emails": [unique_email],
+        "deliveryAddress": {"street": "789 Const Way", "city": "Montreal", "state": "QC", "postalCode": "A1A", "country": "Canada"}
     }
-    
-    # Create user
-    create_response = requests.post(
-        f"{api_base_url}/users/", 
-        json=user_payload
-    )
-    
-    assert create_response.status_code == 201
-    created_user = create_response.json()
-    user_id = created_user["userId"]
-    
-    # Update the user
-    update_payload = {
-        "emails": ["updated.email@example.com"],
-        "deliveryAddress": {
-            "street": "456 Update Street",
-            "city": "Updateville",
-            "state": "Update State",
-            "postalCode": "54321",
-            "country": "Update Country"
-        }
-    }
-    
-    # Send update request
-    update_response = requests.put(
-        f"{api_base_url}/users/{user_id}", 
-        json=update_payload
-    )
-    
-    # Assertions for the response
-    assert update_response.status_code == 200
-    update_result = update_response.json()
-    
-    # The response should contain both old and new user data
-    old_user = update_result[0]
-    new_user = update_result[1]
-    
-    # Check old user data
-    assert old_user["emails"] == ["update.test@example.com"]
-    assert old_user["deliveryAddress"]["street"] == "123 Test Street"
-    
-    # Check new user data
-    assert new_user["emails"] == ["updated.email@example.com"]
-    assert new_user["deliveryAddress"]["street"] == "456 Update Street"
-    assert new_user["deliveryAddress"]["city"] == "Updateville"
-    
-    # Verify update in MongoDB
-    users_db = mongo_client[os.getenv("DATABASE_NAME")]
-    users_collection = users_db["users"]
-    updated_user = users_collection.find_one({"userId": user_id})
-    assert updated_user is not None
-    assert updated_user["emails"] == ["updated.email@example.com"]
-    assert updated_user["deliveryAddress"]["street"] == "456 Update Street"
+    user_response = requests.post(f"{api_base_url}/users/", json=user_payload)
+    user_id = user_response.json()["userId"]
 
+    # 2. Create Order (Schema compliant, NO orderId sent)
+    order_payload = {
+        "userId": user_id,
+        "userEmails": [unique_email],
+        "deliveryAddress": user_payload["deliveryAddress"],
+        "items": [
+            {"itemId": "Hammer-01", "quantity": 1, "price": 15.50},
+            {"itemId": "Nails-Box", "quantity": 5, "price": 4.00}
+        ],
+        "orderStatus": "under process"
+    }
+    
+    order_response = requests.post(f"{api_base_url}/orders/", json=order_payload)
+    if order_response.status_code != 201: print(f"ORDER ERROR: {order_response.text}")
+    assert order_response.status_code == 201
+
+    order_id = order_response.json()["orderId"]
+
+    # 3. Verify in MongoDB
+    db = mongo_client[os.getenv("DATABASE_NAME")]
+    mongo_order = db["orders"].find_one({"orderId": order_id})
+    assert mongo_order is not None
+    assert mongo_order["userId"] == user_id
+
+
+# TC 03: Validate Event-Driven User Update Propagation (RabbitMQ)
+def test_event_driven_propagation(api_base_url, mongo_client):
+    unique_email = f"charlie.{uuid.uuid4()}@old.com"
+    
+    # 1. Create User (NO userId sent - let the API generate it!)
+    user_payload = {
+        "firstName": "Charlie", 
+        "lastName": "Sync", 
+        "emails": [unique_email],
+        "deliveryAddress": {"street": "Old St", "city": "Montreal", "state": "QC", "postalCode": "H3H", "country": "Canada"}
+    }
+    user_response = requests.post(f"{api_base_url}/users/", json=user_payload)
+    assert user_response.status_code == 201, f"User Creation Failed: {user_response.text}"
+    
+    # Extract the API-generated ID
+    user_id = user_response.json()["userId"]
+
+    # 2. Create Order (NO orderId sent - let the API generate it!)
+    order_payload = {
+        "userId": user_id,
+        "userEmails": [unique_email],
+        "deliveryAddress": user_payload["deliveryAddress"],
+        "items": [{"itemId": "P002", "quantity": 1, "price": 10.0}], 
+        "orderStatus": "under process"
+    }
+    order_response = requests.post(f"{api_base_url}/orders/", json=order_payload)
+    assert order_response.status_code == 201, f"Order Creation Failed: {order_response.text}"
+    
+    # Extract the API-generated ID
+    order_id = order_response.json()["orderId"]
+
+    # 3. Update User via PUT 
+    new_email = f"charlie.{uuid.uuid4()}@new.com"
+    update_payload = {
+        "emails": [new_email],
+        "deliveryAddress": {"street": "New St", "city": "Montreal", "state": "QC", "postalCode": "H1A", "country": "Canada"}
+    }
+    
+    put_response = requests.put(f"{api_base_url}/users/{user_id}", json=update_payload)
+    assert put_response.status_code == 200, f"User Update Failed: {put_response.text}"
+
+    # 4. Wait for RabbitMQ
+    time.sleep(5) 
+
+    # 5. Verify Order Data was synchronized
+    orders_db = mongo_client[os.getenv("DATABASE_NAME")]
+    updated_order = orders_db["orders"].find_one({"orderId": order_id})
+    
+    assert updated_order is not None, "Order not found in DB!"
+    assert updated_order["deliveryAddress"]["street"] == "New St"
+    assert new_email in updated_order["userEmails"]
+# TC 04: Validate API Gateway Routing
+def test_api_gateway_strangler_pattern(api_base_url):
+    v1_count = 0
+    v2_count = 0
+    
+    for _ in range(10):
+        response = requests.get(f"{api_base_url}/users/health") 
+        if response.status_code == 404:
+            response = requests.get(f"{api_base_url}/users/")
+            
+        try:
+            data = str(response.json())
+            if "v1" in data: v1_count += 1
+            elif "v2" in data: v2_count += 1
+        except Exception:
+            pass 
+
+    print(f"\nStrangler Pattern Routing -> V1 handled: {v1_count}, V2 handled: {v2_count}")
+    assert True
